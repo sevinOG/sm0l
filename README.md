@@ -4,7 +4,6 @@ Tiny local coding + research agent. Windows dashboard, no heartbeat, user prompt
 
 Short soul, eight tools, autocompaction against the selected model's native context window.
 
-Later: GitHub at [sevinog/sm0l](https://github.com/sevinog/sm0l). Not wired yet.
 
 ## What it is
 
@@ -28,7 +27,7 @@ It will not ping you, cron itself, or invent a turn. You send a message or nothi
 ## Run the EXE
 
 After a build:
-
+(run build.bat first)
 ```
 dist\sm0l\sm0l.exe
 ```
