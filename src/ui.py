@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QKeyEvent
+from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QKeyEvent, QDesktopServices, QGuiApplication
 from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -22,12 +22,17 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
-    QScrollArea,
-    QSpinBox,
-    QSplitter,
+    QDialog,
     QVBoxLayout,
     QWidget,
+    QSplitter,
+    QScrollArea,
+    QSpinBox,
 )
+
+CASHAPP_TAG = "$reshi7"
+CASHAPP_URL = "https://cash.app/$reshi7"
+BTC_ADDRESS = "bc1qp989v95u54zpnmw9j75azwp9hrqnd0k6d7jp3lvv6z3yywpfdutszkkhg6"
 
 from .agent import Agent
 from .compact import compact_threshold, estimate_tokens
@@ -203,6 +208,14 @@ class Dashboard(QMainWindow):
         brand_col.addWidget(sub)
         h.addLayout(brand_col)
         h.addStretch()
+
+        self.donate_button = QPushButton("pls donate, im poor")
+        self.donate_button.setObjectName("donate")
+        self.donate_button.setToolTip("Open the tip jar (optional, no pressure)")
+        self.donate_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.donate_button.clicked.connect(self._on_donate_clicked)
+        h.addWidget(self.donate_button)
+
         self.status_dot = QLabel("ollama ?")
         self.status_dot.setObjectName("StatusDot")
         self.status_dot.setProperty("state", "offline")
@@ -856,6 +869,90 @@ class Dashboard(QMainWindow):
                 self._kick_auto()
         elif not checked:
             self._auto_resume = False
+
+    def _on_donate_clicked(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("sm0l — tip jar")
+        dlg.setMinimumWidth(480)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(18, 18, 18, 18)
+        lay.setSpacing(12)
+
+        title = QLabel("pls donate, im poor")
+        title.setObjectName("Brand")
+        lay.addWidget(title)
+        sub = QLabel("single dad btw...")
+        sub.setObjectName("Muted")
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+
+        cash = QFrame()
+        cash.setObjectName("Panel")
+        cl = QVBoxLayout(cash)
+        cl.setContentsMargins(14, 12, 14, 12)
+        cl.addWidget(self._donate_section_title("Cash App"))
+        tag = QLabel(f"Cashtag: {CASHAPP_TAG}")
+        tag.setObjectName("Dim")
+        cl.addWidget(tag)
+        crow = QHBoxLayout()
+        open_cash = QPushButton(f"Open {CASHAPP_TAG}")
+        open_cash.setObjectName("primary")
+        open_cash.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl(CASHAPP_URL))
+        )
+        crow.addWidget(open_cash)
+        copy_cash = QPushButton("Copy cashtag")
+        copy_cash.setObjectName("ghost")
+        copy_cash.clicked.connect(
+            lambda: (
+                QGuiApplication.clipboard().setText(CASHAPP_TAG),
+                self.status_line.setText(f"Copied Cash App {CASHAPP_TAG}"),
+            )
+        )
+        crow.addWidget(copy_cash)
+        crow.addStretch()
+        cl.addLayout(crow)
+        lay.addWidget(cash)
+
+        btc = QFrame()
+        btc.setObjectName("Panel")
+        bl = QVBoxLayout(btc)
+        bl.setContentsMargins(14, 12, 14, 12)
+        bl.addWidget(self._donate_section_title("Bitcoin (on-chain)"))
+        bl.addWidget(
+            QLabel(
+                "Send BTC to this address from any wallet "
+                "(Electrum, BlueWallet, Sparrow, mobile apps, exchange withdraw):"
+            )
+        )
+        addr = QLineEdit(BTC_ADDRESS)
+        addr.setReadOnly(True)
+        addr.setMinimumHeight(34)
+        bl.addWidget(addr)
+        brow = QHBoxLayout()
+        copy_btc = QPushButton("Copy address")
+        copy_btc.setObjectName("primary")
+        copy_btc.clicked.connect(
+            lambda: (
+                QGuiApplication.clipboard().setText(BTC_ADDRESS),
+                self.status_line.setText("Copied BTC address to clipboard"),
+            )
+        )
+        brow.addWidget(copy_btc)
+        brow.addStretch()
+        bl.addLayout(brow)
+        lay.addWidget(btc)
+
+        close = QPushButton("Close")
+        close.setObjectName("ghost")
+        close.clicked.connect(dlg.accept)
+        lay.addWidget(close, alignment=Qt.AlignmentFlag.AlignRight)
+        dlg.exec()
+
+    def _donate_section_title(self, text: str) -> QLabel:
+        lab = QLabel(text)
+        lab.setObjectName("Section")
+        return lab
 
     def closeEvent(self, event):
         try:

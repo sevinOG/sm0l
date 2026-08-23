@@ -134,6 +134,20 @@ QPushButton#ghost {{
     background-color: transparent;
     border: 1px solid {BORDER_LIGHT};
 }}
+QPushButton#donate {{
+    background-color: transparent;
+    border: 1px solid #4a3a58;
+    border-radius: 8px;
+    color: {TEXT_DIM};
+    font-size: 11px;
+    padding: 5px 10px;
+    min-height: 16px;
+}}
+QPushButton#donate:hover {{
+    color: {ACCENT_SOFT};
+    border-color: {ACCENT};
+    background-color: #1a1524;
+}}
 QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QComboBox, QSpinBox, QDoubleSpinBox {{
     background-color: {BG_INPUT};
     color: {TEXT};
