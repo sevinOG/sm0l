@@ -153,18 +153,15 @@ class Dashboard(QMainWindow):
     def __init__(self, settings: Settings):
         super().__init__()
         self.settings = settings
-        # Load existing session if available, else create new one
-        last_session_path = user_data() / "last_session.json"
-        if last_session_path.is_file():
+        # Always start with a fresh session — no last-session restore
+        self.session = new_session(settings.model)
+        # Optionally delete old last_session.json so it doesn't come back
+        last = user_data() / "last_session.json"
+        if last.is_file():
             try:
-                data = json.loads(last_session_path.read_text(encoding="utf-8"))
-                self.session = load_session(data["id"])
-                if not self.session:
-                    raise ValueError("Corrupt session file")
+                last.unlink()
             except Exception:
-                self.session = new_session(settings.model)
-        else:
-            self.session = new_session(settings.model)
+                pass
         self.worker: AgentWorker | None = None
         self.puller: PullWorker | None = None
         self._stream_bubble: QFrame | None = None
@@ -183,26 +180,6 @@ class Dashboard(QMainWindow):
         self._timer.timeout.connect(self._tick_ollama)
         self._timer.start(8000)
         self._update_ctx_bar()
-        if self.session.messages:
-            for msg in self.session.messages:
-                role = msg.get("role") or msg.get("kind", "assistant")
-                body = msg.get("content") or msg.get("body", "")
-                title = msg.get("title", "")
-                # Skip incomplete assistant messages (partial tokens, no completion flag)
-                if role == "assistant" and (not body or body.endswith("<|") or not msg.get("completed")):
-                    continue
-                if role == "tool":
-                    kind, mono = "tool", True
-                elif role == "user":
-                    kind, mono = "user", False
-                else:
-                    kind, mono = "assistant", False
-                frame = _bubble(kind, title or "", body, mono=mono)
-                self._append_bubble(frame)
-        else:
-            # Show welcome bubble if empty session
-            welcome = "Welcome. Type a prompt to begin."
-            self._append_bubble(_bubble("assistant", "SM0L", welcome))
 
     def _build(self):
         root = QWidget()
