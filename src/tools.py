@@ -1,19 +1,20 @@
 """Small tool set for 8B models: web + files + shell. Results are hard-truncated."""
 from __future__ import annotations
 
-import html
 import json
 import os
 import re
+import signal
 import subprocess
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import html
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable
 
-USER_AGENT = "sm0l/0.1 (local research agent)"
 MAX = {
     "search": 3500,
     "fetch": 6000,
@@ -23,6 +24,12 @@ MAX = {
     "shell": 4000,
     "generic": 4000,
 }
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/128.0.0.0 Safari/537.36"
+)
 
 SCHEMAS: list[dict] = [
     {
@@ -160,12 +167,19 @@ def resolve_path(workspace: Path, path: str | None) -> Path:
     return p
 
 
-def _http_get(url: str, timeout: float = 18) -> tuple[str, str]:
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/128.0.0.0 Safari/537.36"
+)
+
+
+def _http_get(url: str, timeout: float = 18, user_agent: str | None = None) -> tuple[str, str]:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/json,text/plain,*/*",
+            "User-Agent": user_agent or USER_AGENT,
+            "Accept": "text/html,application/json,text/plain,/*",
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -175,9 +189,9 @@ def _http_get(url: str, timeout: float = 18) -> tuple[str, str]:
         if "charset=" in ctype:
             charset = ctype.split("charset=", 1)[1].split(";")[0].strip() or "utf-8"
         try:
-            body = raw.decode(charset, errors="replace")
+            body = raw.decode(charset, errors="surrogateescape")
         except LookupError:
-            body = raw.decode("utf-8", errors="replace")
+            body = raw.decode("utf-8", errors="surrogateescape")
         return resp.geturl(), body
 
 
@@ -227,15 +241,9 @@ def tool_search(query: str, **_k: Any) -> str:
     q = urllib.parse.quote_plus(query)
     try:
         _, body = _http_get(
-            f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1&no_redirect=1"
+            f"https://api.duckduckgo.com/?q={q}&format=json&no_html=1&skip_disambig=1&no_redirect=1&t=sm0l"
         )
         data = json.loads(body)
-        # If API returns no results (empty or missing Abstract), fall back to fetching the search results page
-        if not data.get("AbstractText") and not data.get("Abstract"):
-            url = f"https://duckduckgo.com/?q={q}"
-            _, html_body = _http_get(url)
-            chunks.append(f"Search for \"{query}\"\n\n{html_to_text(html_body)}")
-            return "\n".join(chunks)
         heading = data.get("Heading") or ""
         abstract = data.get("AbstractText") or data.get("Abstract") or ""
         answer = data.get("Answer") or ""
@@ -267,10 +275,16 @@ def tool_search(query: str, **_k: Any) -> str:
         chunks.append(f"(instant answer skipped: {e})")
 
     try:
-        _, body = _http_get(f"https://html.duckduckgo.com/html/?q={q}")
+        _, body = _http_get(
+            f"https://html.duckduckgo.com/html/?q={q}",
+            user_agent=BROWSER_UA,
+        )
         results = _parse_ddg_html(body)
         if not results:
-            _, body = _http_get(f"https://lite.duckduckgo.com/lite/?q={q}")
+            _, body = _http_get(
+                f"https://lite.duckduckgo.com/lite/?q={q}",
+                user_agent=BROWSER_UA,
+            )
             results = _parse_ddg_lite(body)
         if results:
             chunks.append("Results:")
@@ -464,22 +478,35 @@ def tool_shell(workspace: Path, command: str, timeout: int = 60, **_k: Any) -> s
         return "ERROR: empty command"
     if _DENY.search(command):
         return "ERROR: blocked destructive command"
+    is_wsl = "wsl" in command.lower() or "bash" in command.lower()
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             command,
             cwd=str(workspace),
             shell=True,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
             encoding="utf-8",
             errors="replace",
         )
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        return f"ERROR: timed out after {timeout}s"
+        # Kill the process - works for native Windows
+        try:
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
+        if is_wsl:
+            return f"ERROR: timed out after {timeout}s (WSL session)"
+        return f"ERROR: timed out after {timeout}s (stop button pressed)"
     except Exception as e:
         return f"ERROR: {e}"
-    out = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+    out = (stdout or "") + (("\n" + stderr) if stderr else "")
+    # WSL commands may have empty stdout but stderr has output
+    if is_wsl and not stdout and stderr:
+        out = stderr
     return clip(f"exit {proc.returncode}\n{out.strip()}".strip(), MAX["shell"])
 
 

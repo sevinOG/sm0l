@@ -39,7 +39,7 @@ Or double-click `RUN.bat`.
 3. Set workspace if you want a project folder.
 4. Type. Enter sends.
 
-Config and sessions live in `%LOCALAPPDATA%\sm0l\`. Workspace defaults to `%USERPROFILE%\sm0l_workspace` (SOUL.md / AGENTS.md / USER.md are seeded there, OpenClaw-style but short).
+Config and sessions live in `%LOCALAPPDATA%\sm0l\`. Workspace defaults to `%USERPROFILE%\sm0l_workspace` (OPERATIONS.md is seeded there — identity prefs + workspace rules in one file).
 
 ## Build
 
@@ -62,7 +62,7 @@ python -m venv .venv
 | Constraint | How sm0l handles it |
 |---|---|
 | Small context | Detect native `context_length` via Ollama `/api/show`, compact at ~62% |
-| Weak long-prompt following | Soul + workspace digests stay tiny |
+| Weak long-prompt following | RUNTIME + single OPERATIONS.md digest stay tiny |
 | Tool-call drift | 8 tools, 8 round cap, XML fallback if native tools fail |
 | Huge tool dumps | Hard clip on search/fetch/read/shell |
 | No background noise | No heartbeat, no MEMORY.md spam |
