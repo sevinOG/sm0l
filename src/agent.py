@@ -5,7 +5,7 @@ import json
 import re
 from typing import Any, Callable
 
-from .compact import compact_messages, estimate_tokens
+from .compact import compact_messages, compact_threshold, estimate_tokens, hard_trim_messages
 from .ollama_client import chat_stream, effective_num_ctx
 from .personality import build_system_prompt
 from .tools import SCHEMAS, run_tool
@@ -120,6 +120,12 @@ class Agent:
         if note:
             self._fire("compact", text=note)
 
+        # P1-2: mid-loop context-pressure handling.
+        # Policy: at most ONE extra full LLM compact per run(); afterwards, only
+        # cheap hard-trim. This bounds latency and prevents recursive "compact
+        # the compact" cost while still preventing unbounded growth between turns.
+        mid_loop_full_compacts = 0
+
         options = {
             "temperature": self.temperature,
             "num_ctx": self.num_ctx,
@@ -208,6 +214,34 @@ class Agent:
                         "name": name,
                     }
                 )
+
+            # P1-2: after the tool batch, if context is over threshold, compact
+            # or hard-trim before the next model call. Bound full LLM compacts
+            # to one per run(); fall back to hard_trim_messages otherwise.
+            thresh = compact_threshold(self.num_ctx, self.compact_ratio)
+            if not self._cancel and estimate_tokens(messages) >= thresh:
+                if mid_loop_full_compacts < 1:
+                    if mid_loop_full_compacts == 0:
+                        # Only need a small status note; full status comes from
+                        # compact_messages via its on_status callback.
+                        self._fire("compact", text="mid-loop compact")
+                    compacted, mid_note = compact_messages(
+                        self.host,
+                        self.model,
+                        messages,
+                        num_ctx=self.num_ctx,
+                        ratio=self.compact_ratio,
+                        on_status=lambda s: self._fire("compact", text=s),
+                    )
+                    messages = compacted
+                    mid_loop_full_compacts += 1
+                    if mid_note:
+                        self._fire("compact", text=mid_note)
+                else:
+                    before = estimate_tokens(messages)
+                    messages = hard_trim_messages(messages, thresh)
+                    if estimate_tokens(messages) < before:
+                        self._fire("compact", text="mid-loop hard-trim")
 
         else:
             self._fire(
