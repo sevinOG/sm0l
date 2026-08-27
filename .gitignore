@@ -5,3 +5,4 @@ build/
 dist/
 *.spec.bak
 .smoke_ws/
+scripts/_test_p2p3.py

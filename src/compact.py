@@ -19,18 +19,67 @@ COMPACT_SYS = (
     "No tools. No questions."
 )
 
-MAX_TRUNCATE_CHARS = 800  # per-content truncation cap during hard_trim passes
-MAX_TRIM_PASSES = 8       # bounded truncate/system-trim passes to guarantee progress
+MAX_TRUNCATE_CHARS = 800      # cap for non-system content
+MAX_LAST_USER_CHARS = 2000     # P3-3: higher floor for the latest user turn
+MIN_SYSTEM_CHARS = 200         # P3-3: never shrink primary system below this
+MAX_TRIM_PASSES = 8            # bounded passes to guarantee progress
+
+# P2-1: calibrated chars-per-token. Starts at the default; updated from
+# prompt_eval_count after real calls. Clamped to [2, 8] to stay sane.
+_DEFAULT_CPT = 4
+_CPT_MIN, _CPT_MAX = 2, 8
+_cpt: float = _DEFAULT_CPT
+_cpt_ema: float = 0.0  # EMA of (chars / prompt_eval_count) across recent calls
+
+
+def get_cpt() -> float:
+    """Return the current chars-per-token calibration."""
+    return _cpt
+
+
+def calibrate_cpt(chars: int, prompt_tokens: int) -> None:
+    """
+    Update the chars-per-token estimate from a real (chars, prompt_tokens)
+    pair. Uses exponential moving average (alpha=0.3) and clamps to [2, 8].
+    Safe to call with zero/invalid values — those are ignored.
+    """
+    global _cpt, _cpt_ema
+    if not chars or not prompt_tokens or prompt_tokens <= 0:
+        return
+    sample = float(chars) / float(prompt_tokens)
+    if _cpt_ema <= 0:
+        _cpt_ema = sample
+    else:
+        _cpt_ema = 0.3 * sample + 0.7 * _cpt_ema
+    _cpt = max(_CPT_MIN, min(_CPT_MAX, _cpt_ema))
+
+
+def reset_calibration() -> None:
+    """Reset calibration to defaults. Useful on model change."""
+    global _cpt, _cpt_ema
+    _cpt = _DEFAULT_CPT
+    _cpt_ema = 0.0
 
 
 def estimate_tokens(messages: list[dict]) -> int:
     n = 0
+    cpt = _cpt
     for m in messages:
         n += 8
         content = m.get("content") or ""
-        n += int(len(content) / CHARS_PER_TOKEN) + 1
+        n += int(len(content) / cpt) + 1
         for tc in m.get("tool_calls") or []:
-            n += int(len(str(tc)) / CHARS_PER_TOKEN) + 8
+            n += int(len(str(tc)) / cpt) + 8
+    return n
+
+
+def message_chars(messages: list[dict]) -> int:
+    """Total content + tool_call character length — for calibration."""
+    n = 0
+    for m in messages:
+        n += len(m.get("content") or "")
+        for tc in m.get("tool_calls") or []:
+            n += len(str(tc))
     return n
 
 
@@ -60,6 +109,19 @@ def _primary_system(messages: list[dict]) -> dict | None:
     return None
 
 
+def _previous_memory(messages: list[dict]) -> str | None:
+    """Return the body of the most recent [compacted memory] block, or None."""
+    for m in reversed(messages):
+        if m.get("role") != "system":
+            continue
+        content = m.get("content") or ""
+        if str(content).startswith("[compacted memory"):
+            # Strip the header line
+            text = content.split("\n", 1)
+            return text[1] if len(text) > 1 else None
+    return None
+
+
 def split_for_compact(messages: list[dict], keep_user_turns: int = 2) -> tuple[list[dict], list[dict]]:
     """Keep the last N complete user turns (including their tool loops). Never split a tool loop."""
     if len(messages) < 8:
@@ -76,7 +138,7 @@ def split_for_compact(messages: list[dict], keep_user_turns: int = 2) -> tuple[l
     return prefix, suffix
 
 
-def _prefix_text(prefix: list[dict], char_budget: int = 12000) -> str:
+def _prefix_text(prefix: list[dict], char_budget: int = 12000, prev_memory: str | None = None) -> str:
     lines: list[str] = []
     for m in prefix:
         role = m.get("role") or "?"
@@ -95,6 +157,10 @@ def _prefix_text(prefix: list[dict], char_budget: int = 12000) -> str:
             content = content[:800] + "…"
         lines.append(f"{role}: {content}")
     text = "\n".join(lines)
+    if prev_memory:
+        # P3-2: fold the prior summary into the new compress input so memory
+        # accumulates across re-compacts instead of being silently dropped.
+        text = f"Earlier summary (fold into new):\n{prev_memory}\n\n---\nNew turns:\n{text}"
     if len(text) <= char_budget:
         return text
     keep = char_budget // 2
@@ -111,16 +177,19 @@ def _last_user_index(messages: list[dict]) -> int:
 def hard_trim_messages(messages: list[dict], thresh: int) -> list[dict]:
     """
     Reduce a message list so estimate_tokens(messages) <= thresh, with a clear
-    contract:
+    contract (P3-3 — softer order to preserve identity and the active ask):
 
       1. Drop oldest non-system messages first, but never the last user turn
          nor its trailing tool loop. Drop aggressively until under threshold
          or we run out of droppable messages.
-      2. If still over threshold, shrink oversized non-system content (truncate).
-      3. If still over threshold, truncate the primary system prompt to a
-         bounded size (memory system blocks are preserved as-is).
-      4. If still over threshold, the *last user turn's* content is the last
-         resort: truncate it.
+      2. If still over threshold, shrink oversized non-system content
+         (tools, memory body, assistant prose) to MAX_TRUNCATE_CHARS.
+      3. If still over threshold, shrink the *body* of [compacted memory]
+         blocks (keep header) — but only the body, never the marker.
+      4. If still over threshold, truncate the last user turn's content, but
+         never below MAX_LAST_USER_CHARS (preserve the active ask).
+      5. Last resort only: truncate the primary system prompt, but never
+         below MIN_SYSTEM_CHARS (preserve identity / runtime rules).
 
     Bounded — outer loop is capped. Each stage either makes progress or we
     stop. No infinite loops.
@@ -150,18 +219,20 @@ def hard_trim_messages(messages: list[dict], thresh: int) -> list[dict]:
             if first >= last_user:
                 break
             work = work[:first] + work[first + 1 :]
-            # Recompute after drop (indices shifted; last_user may have moved).
             last_user = _last_user_index(work)
             dropped = True
         if estimate_tokens(work) <= thresh:
             return work
         if estimate_tokens(work) < before:
-            continue  # progress was made; loop again
+            continue
 
-        # Stage 2: shrink oversized non-system content.
+        # Stage 2: shrink oversized non-system content (tools, assistant prose).
+        # P3-3: protect the last user turn — its truncation lives in stage 4.
         any_shrunk = False
-        for m in work:
+        for idx, m in enumerate(work):
             if m.get("role") == "system":
+                continue
+            if idx == last_user:
                 continue
             content = m.get("content") or ""
             if len(content) > MAX_TRUNCATE_CHARS:
@@ -170,27 +241,48 @@ def hard_trim_messages(messages: list[dict], thresh: int) -> list[dict]:
         if any_shrunk and estimate_tokens(work) < before:
             continue
 
-        # Stage 3: shrink primary system prompt (skip memory blocks).
+        # Stage 3 (P3-3): shrink the body of [compacted memory] blocks, keep header.
+        mem_shrunk = False
+        for m in work:
+            if m.get("role") != "system":
+                continue
+            content = m.get("content") or ""
+            if not str(content).startswith("[compacted memory"):
+                continue
+            header, _, body = content.partition("\n")
+            if len(body) > MAX_TRUNCATE_CHARS:
+                m["content"] = header + "\n" + body[:MAX_TRUNCATE_CHARS] + "…"
+                mem_shrunk = True
+            elif len(body) > 0:
+                # Already short — skip
+                pass
+        if mem_shrunk and estimate_tokens(work) < before:
+            continue
+
+        # Stage 4 (P3-3): truncate last user turn, but only down to MAX_LAST_USER_CHARS.
+        if last_user >= 0:
+            content = work[last_user].get("content") or ""
+            if len(content) > MAX_LAST_USER_CHARS:
+                work[last_user]["content"] = content[:MAX_LAST_USER_CHARS] + "…"
+                if estimate_tokens(work) < before:
+                    continue
+
+        # Stage 5 (P3-3): last-resort — shrink primary system prompt, never below MIN_SYSTEM_CHARS.
         for m in work:
             if m.get("role") != "system":
                 continue
             content = m.get("content") or ""
             if str(content).startswith("[compacted memory"):
                 continue  # never touch compacted memory blocks
-            if len(content) > MAX_TRUNCATE_CHARS:
-                m["content"] = content[:MAX_TRUNCATE_CHARS] + "…"
-                if estimate_tokens(work) < before:
-                    break
+            if len(content) > MAX_TRUNCATE_CHARS and len(content) > MIN_SYSTEM_CHARS:
+                # Keep at least MIN_SYSTEM_CHARS to preserve identity / runtime rules
+                new_len = max(MIN_SYSTEM_CHARS, MAX_TRUNCATE_CHARS)
+                if len(content) > new_len:
+                    m["content"] = content[:new_len] + "…"
+                    if estimate_tokens(work) < before:
+                        break
         if estimate_tokens(work) < before:
             continue
-
-        # Stage 4: last-resort — truncate the last user turn's content.
-        if last_user >= 0:
-            content = work[last_user].get("content") or ""
-            if len(content) > 400:
-                work[last_user]["content"] = content[:400] + "…"
-                if estimate_tokens(work) < before:
-                    continue
 
         # No progress this iteration — stop to avoid an infinite loop.
         break
@@ -243,7 +335,16 @@ def compact_messages(
     if on_status:
         on_status(f"Compacting {used} tok → {thresh} tok window ({num_ctx} ctx)…")
 
-    blob = _prefix_text(prefix)
+    # P2-2: size the compact sub-call to its own window.
+    # Use the smaller of the effective ctx and 16k (richer summaries for large windows).
+    compact_ctx = min(num_ctx, 16384)
+    num_predict = 400
+    # Reserve space for system prompt + user prompt overhead (~200 tokens).
+    reserve = OUTPUT_RESERVE + 200
+    usable = max(compact_ctx - num_predict - reserve, compact_ctx // 4)
+    char_budget = max(usable * CHARS_PER_TOKEN, 2000)
+
+    blob = _prefix_text(prefix, char_budget=int(char_budget), prev_memory=_previous_memory(messages))
     result = None
     summary = ""
     try:
@@ -256,8 +357,8 @@ def compact_messages(
             ],
             options={
                 "temperature": 0.1,
-                "num_ctx": min(num_ctx, 8192),
-                "num_predict": 400,
+                "num_ctx": compact_ctx,
+                "num_predict": num_predict,
             },
             timeout=120,
         )

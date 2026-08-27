@@ -5,7 +5,8 @@ import json
 import re
 from typing import Any, Callable
 
-from .compact import compact_messages, compact_threshold, estimate_tokens, hard_trim_messages
+from .compact import (compact_messages, compact_threshold, estimate_tokens,
+                            hard_trim_messages, calibrate_cpt, message_chars)
 from .ollama_client import chat_stream, effective_num_ctx
 from .personality import build_system_prompt
 from .tools import SCHEMAS, run_tool
@@ -95,6 +96,7 @@ class Agent:
         self.last_prompt_tokens = 0
         self.last_eval_tokens = 0
         self.num_ctx = 8192
+        self.effective_ctx: int | None = None  # calibrated per-run; synced with compact
         self.rounds = 0
 
     def cancel(self) -> None:
@@ -106,6 +108,9 @@ class Agent:
     def run(self, messages: list[dict]) -> list[dict]:
         self._cancel = False
         self.num_ctx = effective_num_ctx(self.host, self.model, self.num_ctx_override)
+        # P2-3: expose the same effective ctx to the UI so the bar and the
+        # compact threshold agree with what the agent actually uses.
+        self.effective_ctx = self.num_ctx
         messages = _ensure_system(list(messages), self.workspace)
 
         compacted, note = compact_messages(
@@ -168,6 +173,16 @@ class Agent:
 
             self.last_prompt_tokens = int(result.get("prompt_eval_count") or 0)
             self.last_eval_tokens = int(result.get("eval_count") or 0)
+            # P2-1: calibrate our token estimate from real Ollama counts so the
+            # ctx bar and mid-loop threshold stay in sync with the model.
+            if self.last_prompt_tokens > 0:
+                calibrate_cpt(message_chars(messages), self.last_prompt_tokens)
+                self._fire(
+                    "tokens",
+                    used=self.last_prompt_tokens,
+                    est=estimate_tokens(messages),
+                    cpt=get_cpt(),
+                )
             msg = result.get("message") or {"role": "assistant", "content": ""}
             content = msg.get("content") or ""
             tool_calls = list(msg.get("tool_calls") or [])
@@ -201,6 +216,14 @@ class Agent:
                 fn = tc.get("function") or tc
                 name = str(fn.get("name") or "")
                 arguments = _args(fn.get("arguments"))
+                # P3-1: link tool result to its tool_call by id when present;
+                # fall back to a stable per-call id (name + content hash) so
+                # models that require linked ids still work.
+                tc_id = (
+                    tc.get("id")
+                    or fn.get("id")
+                    or f"call_{name}_{abs(hash(name + json.dumps(arguments, sort_keys=True, default=str))) % 0xFFFFFFFF:x}"
+                )
                 self._fire("tool_start", name=name, arguments=arguments)
                 output = run_tool(
                     name, arguments, self.workspace, shell_timeout=self.shell_timeout
@@ -212,6 +235,7 @@ class Agent:
                         "content": output,
                         "tool_name": name,
                         "name": name,
+                        "tool_call_id": tc_id,
                     }
                 )
 

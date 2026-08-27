@@ -172,6 +172,7 @@ class Dashboard(QMainWindow):
         self._stream_bubble: QFrame | None = None
         self._stream_text = ""
         self.native_ctx = 0
+        self.last_prompt_tokens = 0  # real prompt_eval_count from last Ollama call
         self._auto_resume = False
         self._user_stopped = False
         self._auto_hops = 0
@@ -618,12 +619,22 @@ class Dashboard(QMainWindow):
     def _update_ctx_bar(self):
         used = estimate_tokens(self.session.messages)
         self.session.token_estimate = used
-        ctx = self.settings.num_ctx or self.native_ctx or 8192
+        # P2-3: prefer the agent's calibrated effective ctx (override ∩ native)
+        # over raw settings — same source as the compact threshold.
+        effective = None
+        if self.worker and self.worker.agent and self.worker.agent.effective_ctx:
+            effective = int(self.worker.agent.effective_ctx)
+        ctx = effective or (self.settings.num_ctx or self.native_ctx or 8192)
         thresh = compact_threshold(ctx, self.settings.compact_ratio)
         pct = int(min(100, 100 * used / max(ctx, 1)))
         self.ctx_bar.setValue(pct)
+        # P2-1: if we have a real prompt_eval_count from the last call, show it too
+        # so the user can see how far our estimate is from reality.
+        real = ""
+        if self.last_prompt_tokens:
+            real = f"   real {self.last_prompt_tokens:,}"
         self.ctx_label.setText(
-            f"{used:,} / {ctx:,} tok   native {self.native_ctx or '—'}   compact ≥ {thresh:,}"
+            f"{used:,} / {ctx:,} tok   native {self.native_ctx or '—'}   compact ≥ {thresh:,}{real}"
         )
 
     def _reload_models(self):
@@ -806,6 +817,8 @@ class Dashboard(QMainWindow):
         elif kind == "compact":
             self.status_line.setText(data.get("text") or "compacting…")
             self.tool_log.appendPlainText(f"compact: {data.get('text') or ''}")
+            # P2-3: bar reflects the just-changed message list
+            self._update_ctx_bar()
         elif kind == "status":
             self.status_line.setText(data.get("text") or "")
             rnd = data.get("round")
@@ -813,6 +826,12 @@ class Dashboard(QMainWindow):
             if rnd and mx:
                 prefix = "auto · " if self.settings.autorun else ""
                 self.round_label.setText(f"{prefix}{rnd}/{mx}")
+        elif kind == "tokens":
+            # P2-1: real prompt tokens from Ollama, after calibration.
+            used = int(data.get("used") or 0)
+            if used > 0:
+                self.last_prompt_tokens = used
+                self._update_ctx_bar()
         elif kind == "error":
             self._auto_resume = False
             self.status_line.setText(data.get("text") or "error")
