@@ -3,10 +3,18 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from typing import Any, Callable
 
-from .compact import (compact_messages, compact_threshold, estimate_tokens,
-                            hard_trim_messages, calibrate_cpt, message_chars)
+from .compact import (
+    compact_messages,
+    compact_threshold,
+    estimate_tokens,
+    hard_trim_messages,
+    calibrate_cpt,
+    message_chars,
+    get_cpt,
+)
 from .ollama_client import chat_stream, effective_num_ctx
 from .personality import build_system_prompt
 from .tools import SCHEMAS, run_tool
@@ -54,19 +62,20 @@ def parse_text_tool_calls(content: str) -> list[dict]:
 
 def _ensure_system(messages: list[dict], workspace) -> list[dict]:
     prompt = build_system_prompt(workspace)
-    if messages and messages[0].get("role") == "system":
-        messages[0] = {"role": "system", "content": prompt}
-        # drop extra system blocks except compacted memory
-        kept = [messages[0]]
-        for m in messages[1:]:
-            if m.get("role") == "system" and str(m.get("content") or "").startswith("[compacted memory"):
-                kept.append(m)
-            elif m.get("role") != "system":
-                kept.append(m)
-        return kept
-    return [{"role": "system", "content": prompt}] + [
-        m for m in messages if m.get("role") != "system"
-    ]
+    primary = {"role": "system", "content": prompt}
+    last_memory = None
+    rest: list[dict] = []
+    for m in messages:
+        if m.get("role") == "system":
+            if str(m.get("content") or "").startswith("[compacted memory"):
+                last_memory = m
+            continue
+        rest.append(m)
+    kept = [primary]
+    if last_memory:
+        kept.append(last_memory)
+    kept.extend(rest)
+    return kept
 
 
 class Agent:
@@ -123,7 +132,7 @@ class Agent:
         )
         messages = compacted
         if note:
-            self._fire("compact", text=note)
+            self._fire("compact", text=note, estimate=estimate_tokens(messages))
 
         # P1-2: mid-loop context-pressure handling.
         # Policy: at most ONE extra full LLM compact per run(); afterwards, only
@@ -173,8 +182,7 @@ class Agent:
 
             self.last_prompt_tokens = int(result.get("prompt_eval_count") or 0)
             self.last_eval_tokens = int(result.get("eval_count") or 0)
-            # P2-1: calibrate our token estimate from real Ollama counts so the
-            # ctx bar and mid-loop threshold stay in sync with the model.
+            # prompt_eval_count is for the request payload — calibrate before appending the assistant message.
             if self.last_prompt_tokens > 0:
                 calibrate_cpt(message_chars(messages), self.last_prompt_tokens)
                 self._fire(
@@ -217,13 +225,8 @@ class Agent:
                 name = str(fn.get("name") or "")
                 arguments = _args(fn.get("arguments"))
                 # P3-1: link tool result to its tool_call by id when present;
-                # fall back to a stable per-call id (name + content hash) so
-                # models that require linked ids still work.
-                tc_id = (
-                    tc.get("id")
-                    or fn.get("id")
-                    or f"call_{name}_{abs(hash(name + json.dumps(arguments, sort_keys=True, default=str))) % 0xFFFFFFFF:x}"
-                )
+                # fall back to uuid so models that require linked ids still work.
+                tc_id = tc.get("id") or fn.get("id") or uuid.uuid4().hex
                 self._fire("tool_start", name=name, arguments=arguments)
                 output = run_tool(
                     name, arguments, self.workspace, shell_timeout=self.shell_timeout
@@ -260,12 +263,16 @@ class Agent:
                     messages = compacted
                     mid_loop_full_compacts += 1
                     if mid_note:
-                        self._fire("compact", text=mid_note)
+                        self._fire("compact", text=mid_note, estimate=estimate_tokens(messages))
                 else:
                     before = estimate_tokens(messages)
                     messages = hard_trim_messages(messages, thresh)
                     if estimate_tokens(messages) < before:
-                        self._fire("compact", text="mid-loop hard-trim")
+                        self._fire(
+                            "compact",
+                            text="mid-loop hard-trim",
+                            estimate=estimate_tokens(messages),
+                        )
 
         else:
             self._fire(

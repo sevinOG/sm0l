@@ -342,7 +342,7 @@ def compact_messages(
     # Reserve space for system prompt + user prompt overhead (~200 tokens).
     reserve = OUTPUT_RESERVE + 200
     usable = max(compact_ctx - num_predict - reserve, compact_ctx // 4)
-    char_budget = max(usable * CHARS_PER_TOKEN, 2000)
+    char_budget = max(usable * get_cpt(), 2000)
 
     blob = _prefix_text(prefix, char_budget=int(char_budget), prev_memory=_previous_memory(messages))
     result = None

@@ -35,7 +35,7 @@ CASHAPP_URL = "https://cash.app/$reshi7"
 BTC_ADDRESS = "bc1qp989v95u54zpnmw9j75azwp9hrqnd0k6d7jp3lvv6z3yywpfdutszkkhg6"
 
 from .agent import Agent
-from .compact import compact_threshold, estimate_tokens
+from .compact import compact_threshold, estimate_tokens, reset_calibration
 from .config import Settings, save_settings
 from .ollama_client import list_models, native_context_length, ping, pull_model
 from .paths import user_data
@@ -85,13 +85,13 @@ class AgentWorker(QThread):
     def cancel(self):
         if self.agent:
             self.agent.cancel()
-            # Wait for agent to actually stop, with hard timeout
-            import time
-            start = time.monotonic()
-            while time.monotonic() - start < 5:
-                if self.agent._cancel or self.agent.last_prompt_tokens == 0:
-                    break
-                time.sleep(0.1)
+        # Wait on thread end only — last_prompt_tokens == 0 is "no eval yet", not stopped.
+        import time
+        start = time.monotonic()
+        while time.monotonic() - start < 5:
+            if not self.isRunning():
+                break
+            time.sleep(0.1)
 
 
 class PullWorker(QThread):
@@ -172,7 +172,9 @@ class Dashboard(QMainWindow):
         self._stream_bubble: QFrame | None = None
         self._stream_text = ""
         self.native_ctx = 0
+        self.effective_ctx = 0
         self.last_prompt_tokens = 0  # real prompt_eval_count from last Ollama call
+        self._live_used_tokens = 0  # compact/tokens estimate while a worker is in flight
         self._auto_resume = False
         self._user_stopped = False
         self._auto_hops = 0
@@ -443,15 +445,12 @@ class Dashboard(QMainWindow):
         self._stream_text = ""
 
     def _render_history(self):
-        print(f"DEBUG _render_history: session={self.session.id}, messages={len(self.session.messages)}")
         self._clear_chat()
-        print(f"DEBUG after clear, chat_layout count={self.chat_layout.count()}")
-        for i, m in enumerate(self.session.messages):
+        for m in self.session.messages:
             role = m.get("role")
             content = m.get("content") or ""
             if role == "system":
                 continue
-            print(f"DEBUG rendering message {i}: role={role}, content_len={len(content)}")
             if role == "user":
                 self._append_bubble(_bubble("user", "YOU", content))
             elif role == "assistant":
@@ -467,7 +466,6 @@ class Dashboard(QMainWindow):
             elif role == "tool":
                 name = m.get("tool_name") or "tool"
                 self._append_bubble(_bubble("tool", f"RESULT  {name}", content[:1200], mono=True))
-        print(f"DEBUG after loop, chat_layout count={self.chat_layout.count()}")
         self._update_ctx_bar()
 
     def _refresh_sessions(self):
@@ -491,6 +489,10 @@ class Dashboard(QMainWindow):
         self._clear_chat()
         self._refresh_sessions()
         self.status_line.setText("New session.")
+        self.effective_ctx = 0
+        self.last_prompt_tokens = 0
+        self._live_used_tokens = 0
+        reset_calibration()
         self._update_ctx_bar()
 
     def _delete_session(self):
@@ -533,7 +535,6 @@ class Dashboard(QMainWindow):
         if not loaded:
             QMessageBox.warning(self, "Session Load", f"Failed to load session {sid}")
             return
-        print(f"DEBUG _on_session_clicked: switching to {sid}, messages={len(loaded.messages)}")
         self.session.save()
         self.session = loaded
         self.tool_log.clear()
@@ -551,7 +552,6 @@ class Dashboard(QMainWindow):
         if not loaded:
             QMessageBox.warning(self, "Session Load", f"Failed to load session {sid}")
             return
-        print(f"DEBUG _on_session_selected: switching to {sid}, messages={len(loaded.messages)}")
         self.session.save()
         self.session = loaded
         self.tool_log.clear()
@@ -603,12 +603,18 @@ class Dashboard(QMainWindow):
         self.settings.model = name
         save_settings(self.settings)
         self.session.model = name
+        reset_calibration()
+        self.effective_ctx = 0
         self._refresh_ctx_for_model()
 
     def _refresh_ctx_for_model(self):
         model = self._current_model()
         if not model:
             return
+        if getattr(self, "_ctx_model", None) != model:
+            reset_calibration()
+            self.effective_ctx = 0
+            self._ctx_model = model
         try:
             self.native_ctx = native_context_length(self.settings.ollama_host, model)
         except Exception:
@@ -617,19 +623,21 @@ class Dashboard(QMainWindow):
         self._update_ctx_bar()
 
     def _update_ctx_bar(self):
-        used = estimate_tokens(self.session.messages)
+        if self.worker and self.worker.isRunning() and self._live_used_tokens:
+            used = self._live_used_tokens
+        else:
+            used = estimate_tokens(self.session.messages)
         self.session.token_estimate = used
-        # P2-3: prefer the agent's calibrated effective ctx (override ∩ native)
-        # over raw settings — same source as the compact threshold.
-        effective = None
         if self.worker and self.worker.agent and self.worker.agent.effective_ctx:
-            effective = int(self.worker.agent.effective_ctx)
-        ctx = effective or (self.settings.num_ctx or self.native_ctx or 8192)
+            ctx = int(self.worker.agent.effective_ctx)
+        elif self.effective_ctx:
+            ctx = int(self.effective_ctx)
+        else:
+            # num_ctx == 0 means auto → native
+            ctx = self.settings.num_ctx or self.native_ctx or 8192
         thresh = compact_threshold(ctx, self.settings.compact_ratio)
         pct = int(min(100, 100 * used / max(ctx, 1)))
         self.ctx_bar.setValue(pct)
-        # P2-1: if we have a real prompt_eval_count from the last call, show it too
-        # so the user can see how far our estimate is from reality.
         real = ""
         if self.last_prompt_tokens:
             real = f"   real {self.last_prompt_tokens:,}"
@@ -817,7 +825,9 @@ class Dashboard(QMainWindow):
         elif kind == "compact":
             self.status_line.setText(data.get("text") or "compacting…")
             self.tool_log.appendPlainText(f"compact: {data.get('text') or ''}")
-            # P2-3: bar reflects the just-changed message list
+            # session.messages is stale mid-turn; use the event estimate until the worker finishes.
+            if data.get("estimate") is not None:
+                self._live_used_tokens = int(data["estimate"])
             self._update_ctx_bar()
         elif kind == "status":
             self.status_line.setText(data.get("text") or "")
@@ -831,6 +841,7 @@ class Dashboard(QMainWindow):
             used = int(data.get("used") or 0)
             if used > 0:
                 self.last_prompt_tokens = used
+                self._live_used_tokens = used
                 self._update_ctx_bar()
         elif kind == "error":
             self._auto_resume = False
@@ -847,7 +858,7 @@ class Dashboard(QMainWindow):
             else:
                 self.status_line.setText("Round cap hit.")
             if data.get("num_ctx"):
-                self.native_ctx = int(data["num_ctx"])
+                self.effective_ctx = int(data["num_ctx"])
             self._update_ctx_bar()
 
     def _on_worker_finished(self):
@@ -855,7 +866,11 @@ class Dashboard(QMainWindow):
             self.session.messages = self.worker.result_messages
             self.session.token_estimate = estimate_tokens(self.session.messages)
             self.session.native_ctx = self.native_ctx
+            agent = self.worker.agent
+            if agent and agent.effective_ctx:
+                self.effective_ctx = int(agent.effective_ctx)
             self.session.save()
+        self._live_used_tokens = 0
         resume = self._auto_resume and self.settings.autorun and not self._user_stopped
         self._auto_resume = False
         self._set_busy(False)
