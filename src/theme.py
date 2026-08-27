@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 
 APP_NAME = "sm0l"
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.5"
 APP_TITLE = f"{APP_NAME} v{APP_VERSION}"
 
 BG = "#0B0E14"
