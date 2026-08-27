@@ -60,16 +60,6 @@ def _primary_system(messages: list[dict]) -> dict | None:
     return None
 
 
-def _memory_system(messages: list[dict]) -> dict | None:
-    for m in messages:
-        if m.get("role") != "system":
-            continue
-        content = m.get("content") or ""
-        if str(content).startswith("[compacted memory"):
-            return {"role": "system", "content": content}
-    return None
-
-
 def split_for_compact(messages: list[dict], keep_user_turns: int = 2) -> tuple[list[dict], list[dict]]:
     """Keep the last N complete user turns (including their tool loops). Never split a tool loop."""
     if len(messages) < 8:
@@ -78,8 +68,6 @@ def split_for_compact(messages: list[dict], keep_user_turns: int = 2) -> tuple[l
     if len(user_idxs) <= keep_user_turns:
         return [], messages
     cut = user_idxs[-keep_user_turns]
-    # Only rewind if we landed *inside* a tool loop (assistant + tool msgs).
-    # A user cut point is a real turn boundary — tools *before* it belong to prefix.
     while cut > 0 and _is_toolish(messages[cut]):
         cut -= 1
     prefix, suffix = messages[:cut], messages[cut:]
@@ -111,25 +99,6 @@ def _prefix_text(prefix: list[dict], char_budget: int = 12000) -> str:
         return text
     keep = char_budget // 2
     return text[:keep] + "\n…\n" + text[-keep:]
-
-
-def _drop_oldest_non_system(messages: list[dict], last_user_idx: int) -> list[dict]:
-    """
-    Pop the oldest non-system message that is not the protected last user turn
-    and not a tool/assistant message that immediately follows it (its tool loop).
-    Returns the same list (mutated) for convenience.
-    """
-    # Find non-system messages in order
-    non_sys_positions = [i for i, m in enumerate(messages) if m.get("role") != "system"]
-    if not non_sys_positions:
-        return messages
-    # Determine the protected tail: from last_user_idx to end (last user turn + its tool loop)
-    protected_start = last_user_idx
-    # Pop the first non-system position that is not within the protected tail
-    for pos in non_sys_positions:
-        if pos < protected_start:
-            return messages[:pos] + messages[pos + 1:]
-    return messages
 
 
 def _last_user_index(messages: list[dict]) -> int:
@@ -234,33 +203,6 @@ def _hard_trim(messages: list[dict], thresh: int) -> list[dict]:
     return hard_trim_messages(messages, thresh)
 
 
-def ensure_recent_suffix(
-    kept: list[dict], original: list[dict], keep_user_turns: int = 2
-) -> list[dict]:
-    """
-    Safety net: if `kept` is still over the implicit "small" floor (i.e. the
-    hard-trim did not reduce enough and we are missing recent user turns),
-    graft the last N user turns (and their tool loops) from `original` onto
-    `kept`. Never re-introduces the full pre-compact history.
-
-    Only does work if kept is short on recent user turns AND `original` had them.
-    """
-    kept_user_count = sum(1 for m in kept if m.get("role") == "user")
-    if kept_user_count >= keep_user_turns:
-        return kept
-    if len(kept) >= len(original):
-        return kept
-    # Find last keep_user_turns user indices in original
-    orig_user_idxs = [i for i, m in enumerate(original) if m.get("role") == "user"]
-    if len(orig_user_idxs) < keep_user_turns:
-        return kept
-    keep_from = orig_user_idxs[-keep_user_turns]
-    tail = original[keep_from:]
-    if not tail:
-        return kept
-    return kept + tail
-
-
 def compact_messages(
     host: str,
     model: str,
@@ -286,14 +228,17 @@ def compact_messages(
 
     # Identify structural pieces from the input up front.
     primary = _primary_system(messages) or {"role": "system", "content": ""}
-    suffix_non_sys = [m for m in messages if m.get("role") != "system"]
 
     prefix, split_suffix = split_for_compact(messages)
     if not prefix:
         # Could not split turns (e.g. too few user turns) — fall through to hard-trim.
+        suffix_non_sys = [m for m in messages if m.get("role") != "system"]
         kept = [primary] + suffix_non_sys
         kept = hard_trim_messages(kept, thresh)
         return kept, "hard-trimmed (could not split turns)"
+
+    # Use split_suffix to get the non-system suffix messages
+    suffix_non_sys = [m for m in split_suffix if m.get("role") != "system"]
 
     if on_status:
         on_status(f"Compacting {used} tok → {thresh} tok window ({num_ctx} ctx)…")
