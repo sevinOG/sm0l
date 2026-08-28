@@ -10,13 +10,30 @@ logger = logging.getLogger(__name__)
 
 # 8B models need headroom for the next user turn + a couple of tool results
 OUTPUT_RESERVE = 2048
-CHARS_PER_TOKEN = 4
+
+
+def _strip_think(text: str) -> str:
+    """Remove qwen3 / DeepSeek-R1 style think blocks from the response text."""
+    import re
+    # Strip a leading think/reasoning block. qwen3 often emits this form:
+    #   thinking:\n  ...\n\nThe actual response
+    # or a "thinking: ..." prefix before the real content.
+    text = re.sub(r'^thinking?:\s*', '', text, flags=re.IGNORECASE)
+    # Collapse any leading blank lines after stripping
+    text = re.sub(r'^\s*\n+', '', text)
+    return text.strip()
 
 COMPACT_SYS = (
-    "You compress a chat log into a brief for your future self. "
-    "Keep: user goals, file paths, commands, decisions, errors, unfinished work. "
-    "Drop greetings and repeated tool dumps. Output plain prose, max 280 words. "
-    "No tools. No questions."
+    "You compress a chat log into a condensed operational log for your future self. "
+    "Preserve verbatim: user goals, requests, and instructions exactly as given. "
+    "For each user input, note: what was attempted, what succeeded or failed, "
+    "decisions made, errors encountered, and next steps still pending. "
+    "Keep all file paths, commands run, and their outcomes. "
+    "Preserve unfinished work — do not drop it. "
+    "Drop: redundant tool result dumps, boilerplate, repeated errors already logged. "
+    "Do NOT summarize or re-state system instructions, personality rules, "
+    "or operational loop logic — you receive those on every call. "
+    "Output a clear, dense event log in plain prose. No tools. No questions."
 )
 
 MAX_TRUNCATE_CHARS = 800      # cap for non-system content
@@ -174,7 +191,7 @@ def _last_user_index(messages: list[dict]) -> int:
     return -1
 
 
-def hard_trim_messages(messages: list[dict], thresh: int) -> list[dict]:
+def hard_trim_messages(messages: list[dict], thresh: int, *, protect_fresh_memory: bool = False) -> list[dict]:
     """
     Reduce a message list so estimate_tokens(messages) <= thresh, with a clear
     contract (P3-3 — softer order to preserve identity and the active ask):
@@ -242,22 +259,26 @@ def hard_trim_messages(messages: list[dict], thresh: int) -> list[dict]:
             continue
 
         # Stage 3 (P3-3): shrink the body of [compacted memory] blocks, keep header.
-        mem_shrunk = False
-        for m in work:
-            if m.get("role") != "system":
+        # When protect_fresh_memory=True (just after a successful compact), skip
+        # this stage entirely — the memory was just sized to the model's
+        # num_predict budget and shrinking it again drops accumulated context.
+        if not protect_fresh_memory:
+            mem_shrunk = False
+            for m in work:
+                if m.get("role") != "system":
+                    continue
+                content = m.get("content") or ""
+                if not str(content).startswith("[compacted memory"):
+                    continue
+                header, _, body = content.partition("\n")
+                if len(body) > MAX_TRUNCATE_CHARS:
+                    m["content"] = header + "\n" + body[:MAX_TRUNCATE_CHARS] + "…"
+                    mem_shrunk = True
+                elif len(body) > 0:
+                    # Already short — skip
+                    pass
+            if mem_shrunk and estimate_tokens(work) < before:
                 continue
-            content = m.get("content") or ""
-            if not str(content).startswith("[compacted memory"):
-                continue
-            header, _, body = content.partition("\n")
-            if len(body) > MAX_TRUNCATE_CHARS:
-                m["content"] = header + "\n" + body[:MAX_TRUNCATE_CHARS] + "…"
-                mem_shrunk = True
-            elif len(body) > 0:
-                # Already short — skip
-                pass
-        if mem_shrunk and estimate_tokens(work) < before:
-            continue
 
         # Stage 4 (P3-3): truncate last user turn, but only down to MAX_LAST_USER_CHARS.
         if last_user >= 0:
@@ -336,13 +357,20 @@ def compact_messages(
         on_status(f"Compacting {used} tok → {thresh} tok window ({num_ctx} ctx)…")
 
     # P2-2: size the compact sub-call to its own window.
-    # Use the smaller of the effective ctx and 16k (richer summaries for large windows).
-    compact_ctx = min(num_ctx, 16384)
-    num_predict = 400
+    # No hard cap on compact_ctx — the summary quality scales with input depth.
+    compact_ctx = num_ctx
+    # Scale num_predict with the window being summarized so large contexts get
+    # proportionally richer summaries instead of a flat 600-token budget.
+    num_predict = max(600, num_ctx // 4)
     # Reserve space for system prompt + user prompt overhead (~200 tokens).
     reserve = OUTPUT_RESERVE + 200
     usable = max(compact_ctx - num_predict - reserve, compact_ctx // 4)
     char_budget = max(usable * get_cpt(), 2000)
+
+    # Warn if ctx is large enough that the selected model may struggle to fit
+    # both the prompt and a high-quality summary in VRAM simultaneously.
+    if num_ctx > 16384 and on_status:
+        on_status(f"Large context ({num_ctx:,} tok) — compact uses full window; results may vary on small models.")
 
     blob = _prefix_text(prefix, char_budget=int(char_budget), prev_memory=_previous_memory(messages))
     result = None
@@ -360,9 +388,12 @@ def compact_messages(
                 "num_ctx": compact_ctx,
                 "num_predict": num_predict,
             },
+            think=False,  # qwen3 / reasoning models: disable thinking so tokens go to the summary
             timeout=120,
         )
-        summary = ((result.get("message") or {}).get("content") or "").strip()
+        raw_content = ((result.get("message") or {}).get("content") or "")
+        # Strip qwen3 / DeepSeek-R1 style think blocks defensively
+        summary = _strip_think(raw_content).strip()
     except Exception as e:
         summary = ""
         result = None
@@ -384,5 +415,7 @@ def compact_messages(
         "content": "[compacted memory — earlier turns]\n" + summary,
     }
     new_msgs = [primary, memory] + suffix_non_sys
-    new_msgs = hard_trim_messages(new_msgs, thresh)
+    # Protect the freshly-created memory from Stage 3 shrinking — it was just
+    # sized to num_predict tokens by the model and represents accumulated context.
+    new_msgs = hard_trim_messages(new_msgs, thresh, protect_fresh_memory=True)
     return new_msgs, summary[:240]

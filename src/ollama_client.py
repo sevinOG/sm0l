@@ -102,8 +102,10 @@ def native_context_length(host: str, name: str) -> int:
                         break
     if ctx <= 0:
         ctx = 8192
-    # 8B + huge windows thrash VRAM; cap at 32k unless the native window is smaller
-    return min(ctx, 32768) if ctx >= 4096 else ctx
+    # No hard cap — the model reports what it reports. Callers (UI, agent) are
+    # responsible for warning the user when a window is large enough to thrash
+    # VRAM on small (8B-class) local models.
+    return ctx
 
 
 def effective_num_ctx(host: str, model: str, override: int) -> int:
@@ -120,6 +122,7 @@ def chat_once(
     *,
     tools: list[dict] | None = None,
     options: dict | None = None,
+    think: bool | None = None,
     timeout: float = 180,
 ) -> dict:
     payload: dict[str, Any] = {
@@ -130,6 +133,8 @@ def chat_once(
     }
     if tools:
         payload["tools"] = tools
+    if think is not None:
+        payload["think"] = think
     return _request(host, "/api/chat", payload, timeout=timeout)
 
 
@@ -140,6 +145,7 @@ def chat_stream(
     *,
     tools: list[dict] | None = None,
     options: dict | None = None,
+    think: bool | None = None,
     timeout: float = 600,
     on_token: Callable[[str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
@@ -156,6 +162,8 @@ def chat_stream(
     }
     if tools:
         payload["tools"] = tools
+    if think is not None:
+        payload["think"] = think
 
     def _run(with_tools: bool) -> dict:
         body = dict(payload)
