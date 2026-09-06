@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Callable
 
+from .media import IMAGE_TOKENS, attachment_count
 from .ollama_client import chat_once
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ def estimate_tokens(messages: list[dict]) -> int:
         n += int(len(content) / cpt) + 1
         for tc in m.get("tool_calls") or []:
             n += int(len(str(tc)) / cpt) + 8
+        n += attachment_count(m) * IMAGE_TOKENS
     return n
 
 
@@ -168,6 +170,10 @@ def _prefix_text(prefix: list[dict], char_budget: int = 12000, prev_memory: str 
                 fn = tc.get("function") or tc
                 names.append(str(fn.get("name") or "?"))
             content = (content + "\n" if content else "") + "tools: " + ", ".join(names)
+        n_img = attachment_count(m)
+        if n_img:
+            label = f"[{n_img} image{'s' if n_img != 1 else ''}]"
+            content = f"{content} {label}".strip()
         if not content:
             continue
         if len(content) > 800:

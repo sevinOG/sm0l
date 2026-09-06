@@ -125,9 +125,11 @@ def chat_once(
     think: bool | None = None,
     timeout: float = 180,
 ) -> dict:
+    from .media import prepare_ollama_messages
+
     payload: dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": prepare_ollama_messages(messages),
         "stream": False,
         "options": options or {},
     }
@@ -154,9 +156,11 @@ def chat_stream(
     Stream a chat turn. Returns the assembled assistant message plus usage:
       {message, prompt_eval_count, eval_count, used_tools_api}
     """
+    from .media import prepare_ollama_messages
+
     payload: dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": prepare_ollama_messages(messages),
         "stream": True,
         "options": options or {},
     }

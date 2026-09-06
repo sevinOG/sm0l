@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QKeyEvent, QDesktopServices, QGuiApplication
+from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal, QMimeData
+from PyQt6.QtGui import QKeyEvent, QDesktopServices, QGuiApplication, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
@@ -37,6 +37,7 @@ BTC_ADDRESS = "bc1qp989v95u54zpnmw9j75azwp9hrqnd0k6d7jp3lvv6z3yywpfdutszkkhg6"
 from .agent import Agent
 from .compact import compact_threshold, estimate_tokens, reset_calibration
 from .config import Settings, save_settings
+from .media import MAX_ATTACH, attachments_of, encode_qimage, is_image_path, save_encoded
 from .ollama_client import list_models, native_context_length, ping, pull_model
 from .paths import user_data
 from .personality import seed_workspace
@@ -114,6 +115,11 @@ class PullWorker(QThread):
 
 class InputBox(QPlainTextEdit):
     send = pyqtSignal()
+    attach = pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -124,8 +130,65 @@ class InputBox(QPlainTextEdit):
             return
         super().keyPressEvent(event)
 
+    def canInsertFromMimeData(self, source: QMimeData) -> bool:
+        if source and (source.hasImage() or source.hasUrls()):
+            return True
+        return super().canInsertFromMimeData(source)
 
-def _bubble(kind: str, title: str, body: str, mono: bool = False) -> QFrame:
+    def insertFromMimeData(self, source: QMimeData) -> None:
+        if source is None:
+            return
+        if source.hasImage():
+            img = source.imageData()
+            if img is not None:
+                self.attach.emit(img)
+                return
+        if source.hasUrls():
+            paths = [
+                u.toLocalFile()
+                for u in source.urls()
+                if u.isLocalFile() and is_image_path(u.toLocalFile())
+            ]
+            if paths:
+                self.attach.emit(paths)
+                return
+        super().insertFromMimeData(source)
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md and (md.hasImage() or md.hasUrls()):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        self.insertFromMimeData(event.mimeData())
+        event.acceptProposedAction()
+
+
+def _thumb_row(attachments: list) -> QHBoxLayout:
+    row = QHBoxLayout()
+    row.setSpacing(8)
+    for a in attachments:
+        path = a.get("path") if isinstance(a, dict) else str(a)
+        pix = QPixmap(str(path))
+        if pix.isNull():
+            continue
+        pix = pix.scaled(
+            140,
+            140,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        lab = QLabel()
+        lab.setPixmap(pix)
+        lab.setToolTip(a.get("name") if isinstance(a, dict) else str(path))
+        row.addWidget(lab)
+    row.addStretch()
+    return row
+
+
+def _bubble(kind: str, title: str, body: str, mono: bool = False, attachments: list | None = None) -> QFrame:
     frame = QFrame()
     frame.setObjectName(
         {"user": "UserBubble", "assistant": "AssistantBubble"}.get(kind, "ToolBubble")
@@ -148,7 +211,12 @@ def _bubble(kind: str, title: str, body: str, mono: bool = False) -> QFrame:
         color = TEXT if kind != "user" else TEXT
         body_lbl.setStyleSheet(f"color: {color}; font-size: 13px;")
     lay.addWidget(cap)
-    lay.addWidget(body_lbl)
+    if body:
+        lay.addWidget(body_lbl)
+    if attachments:
+        lay.addLayout(_thumb_row(attachments))
+    if not body and not attachments:
+        lay.addWidget(body_lbl)
     frame._body = body_lbl  # type: ignore[attr-defined]
     frame._raw = body  # type: ignore[attr-defined]
     return frame
@@ -179,6 +247,7 @@ class Dashboard(QMainWindow):
         self._user_stopped = False
         self._auto_hops = 0
         self._sending_auto = False
+        self._pending: list[dict] = []
         self._build()
         seed_workspace(self.settings.resolved_workspace())
         self._refresh_sessions()
@@ -321,12 +390,25 @@ class Dashboard(QMainWindow):
         lay.addWidget(self.status_line)
 
         self.input = InputBox()
-        self.input.setPlaceholderText("Ask sm0l  ·  Enter to send  ·  Shift+Enter for newline")
+        self.input.setPlaceholderText("Ask sm0l  ·  Enter to send  ·  paste or Image to attach")
         self.input.setFixedHeight(90)
         self.input.send.connect(self._send)
+        self.input.attach.connect(self._on_input_attach)
         lay.addWidget(self.input)
 
+        self.attach_strip = QWidget()
+        self.attach_layout = QHBoxLayout(self.attach_strip)
+        self.attach_layout.setContentsMargins(0, 0, 0, 0)
+        self.attach_layout.setSpacing(8)
+        self.attach_strip.hide()
+        lay.addWidget(self.attach_strip)
+
         nav = QHBoxLayout()
+        self.attach_btn = QPushButton("Image")
+        self.attach_btn.setObjectName("ghost")
+        self.attach_btn.setToolTip("Attach images to this message (or paste / drop)")
+        self.attach_btn.clicked.connect(self._pick_images)
+        nav.addWidget(self.attach_btn)
         nav.addStretch()
         self.autorun_toggle = QPushButton("Auto")
         self.autorun_toggle.setObjectName("ghost")
@@ -452,7 +534,7 @@ class Dashboard(QMainWindow):
             if role == "system":
                 continue
             if role == "user":
-                self._append_bubble(_bubble("user", "YOU", content))
+                self._append_bubble(_bubble("user", "YOU", content, attachments=attachments_of(m)))
             elif role == "assistant":
                 if content.strip():
                     self._append_bubble(_bubble("assistant", "SM0L", content))
@@ -721,6 +803,7 @@ class Dashboard(QMainWindow):
     def _set_busy(self, busy: bool):
         self.send_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
+        self.attach_btn.setEnabled(not busy)
         self.input.setReadOnly(busy)
         self.session_list.setEnabled(not busy)
         if busy:
@@ -731,13 +814,105 @@ class Dashboard(QMainWindow):
 
     def _send(self):
         text = self.input.toPlainText().strip()
-        if not text:
+        atts = list(self._pending)
+        if not text and not atts:
             return
         self.input.clear()
+        self._pending.clear()
+        self._refresh_attach_strip()
         self._auto_hops = 0
-        self._dispatch(text, from_auto=False)
+        self._dispatch(text, from_auto=False, attachments=atts)
 
-    def _dispatch(self, text: str, *, from_auto: bool) -> bool:
+    def _on_input_attach(self, payload) -> None:
+        if isinstance(payload, list):
+            for p in payload:
+                self._add_path(str(p))
+            return
+        self._add_qimage(payload, "paste.png")
+
+    def _pick_images(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Attach images",
+            str(self.settings.resolved_workspace()),
+            "Images (*.png *.jpg *.jpeg *.webp *.gif *.bmp);;All files (*)",
+        )
+        for f in files:
+            self._add_path(f)
+
+    def _add_path(self, path: str) -> None:
+        if not is_image_path(path):
+            self.status_line.setText(f"Not an image: {path}")
+            return
+        img = QImage(path)
+        if img.isNull():
+            self.status_line.setText(f"Could not read image: {path}")
+            return
+        self._add_qimage(img, Path(path).name)
+
+    def _add_qimage(self, image, name: str) -> None:
+        if len(self._pending) >= MAX_ATTACH:
+            self.status_line.setText(f"Max {MAX_ATTACH} images per message")
+            return
+        try:
+            data, mime, _ext = encode_qimage(image)
+            att = save_encoded(data, mime, name)
+        except Exception as e:
+            self.status_line.setText(f"Could not attach image: {e}")
+            return
+        self._pending.append(att)
+        self._refresh_attach_strip()
+        self.status_line.setText(f"Attached {att.get('name') or 'image'} ({len(self._pending)}/{MAX_ATTACH})")
+
+    def _remove_pending(self, idx: int) -> None:
+        if 0 <= idx < len(self._pending):
+            att = self._pending.pop(idx)
+            try:
+                Path(att["path"]).unlink(missing_ok=True)
+            except Exception:
+                pass
+        self._refresh_attach_strip()
+
+    def _refresh_attach_strip(self) -> None:
+        while self.attach_layout.count():
+            item = self.attach_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        if not self._pending:
+            self.attach_strip.hide()
+            return
+        for i, att in enumerate(self._pending):
+            chip = QFrame()
+            chip.setObjectName("ToolBubble")
+            h = QHBoxLayout(chip)
+            h.setContentsMargins(6, 4, 6, 4)
+            h.setSpacing(6)
+            pix = QPixmap(att["path"])
+            thumb = QLabel()
+            if not pix.isNull():
+                thumb.setPixmap(
+                    pix.scaled(
+                        48,
+                        48,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+            h.addWidget(thumb)
+            name = QLabel(att.get("name") or "image")
+            name.setObjectName("Dim")
+            h.addWidget(name)
+            rm = QPushButton("×")
+            rm.setObjectName("ghost")
+            rm.setFixedWidth(28)
+            rm.clicked.connect(lambda _checked=False, idx=i: self._remove_pending(idx))
+            h.addWidget(rm)
+            self.attach_layout.addWidget(chip)
+        self.attach_layout.addStretch()
+        self.attach_strip.show()
+
+    def _dispatch(self, text: str, *, from_auto: bool, attachments: list | None = None) -> bool:
         if self.worker and self.worker.isRunning():
             return False
         model = self._current_model()
@@ -759,12 +934,18 @@ class Dashboard(QMainWindow):
         self._auto_resume = False
         self._sending_auto = from_auto
         if not from_auto:
-            self.session.touch_title(text)
-        self.session.messages.append({"role": "user", "content": text})
+            title_src = text or (
+                (attachments[0].get("name") if attachments else "") or "image"
+            )
+            self.session.touch_title(title_src)
+        msg: dict = {"role": "user", "content": text}
+        if attachments:
+            msg["attachments"] = list(attachments)
+        self.session.messages.append(msg)
         self.session.model = model
         self.session.save()
         title = "AUTO" if from_auto else "YOU"
-        self._append_bubble(_bubble("user", title, text))
+        self._append_bubble(_bubble("user", title, text, attachments=attachments))
         self._stream_bubble = None
         self._stream_text = ""
         self.tool_log.appendPlainText("— auto —" if from_auto else "— turn —")

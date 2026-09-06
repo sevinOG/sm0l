@@ -9,6 +9,8 @@ sys.path.insert(0, str(ROOT))
 
 from src.agent import parse_text_tool_calls
 from src.compact import compact_threshold, estimate_tokens, split_for_compact
+from src.compact import compact_threshold, estimate_tokens, split_for_compact
+from src.media import attachments_to_b64, prepare_ollama_messages, save_encoded
 from src.tools import clip, html_to_text, run_tool, tool_edit_file, tool_write_file
 
 
