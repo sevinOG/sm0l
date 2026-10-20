@@ -1,11 +1,12 @@
-"""Autocompaction using the selected model, sized to its native context window."""
+"""Autocompaction on Grok, sized to the xAI context window."""
 from __future__ import annotations
 
 import logging
 from typing import Callable
 
 from .media import IMAGE_TOKENS, attachment_count
-from .ollama_client import chat_once
+from .chat import complete as chat_once
+from .reasoning import compact_predict, finish_call, split_think
 
 logger = logging.getLogger(__name__)
 
@@ -330,10 +331,14 @@ def compact_messages(
     num_ctx: int,
     ratio: float = 0.62,
     on_status: Callable[[str], None] | None = None,
+    provider: str = "xai",
+    api_key: str = "",
+    reasoning: str = "off",
+    on_reasoning=None,
 ) -> tuple[list[dict], str | None]:
     """
-    If over the model's compact threshold, summarize the older turns with the
-    same model and splice a memory block back in. Returns (messages, note).
+    If over the compact threshold, summarize the older turns with the active
+    model and splice a memory block back in. Returns (messages, note).
 
     Successful compact  -> primary system + one memory system + non-system suffix,
                            then hard-trim only. No full-history rebuild.
@@ -365,27 +370,31 @@ def compact_messages(
     # P2-2: size the compact sub-call to its own window.
     # No hard cap on compact_ctx — the summary quality scales with input depth.
     compact_ctx = num_ctx
-    # Scale num_predict with the window being summarized so large contexts get
-    # proportionally richer summaries instead of a flat 600-token budget.
-    num_predict = max(600, num_ctx // 4)
+    # Scale the summary with the window, but cap it. Grok's 128k window would
+    # otherwise request ~32k output tokens and blow the 120s compact timeout.
+    num_predict = compact_predict(provider, reasoning, num_ctx)
     # Reserve space for system prompt + user prompt overhead (~200 tokens).
     reserve = OUTPUT_RESERVE + 200
     usable = max(compact_ctx - num_predict - reserve, compact_ctx // 4)
     char_budget = max(usable * get_cpt(), 2000)
 
-    # Warn if ctx is large enough that the selected model may struggle to fit
-    # both the prompt and a high-quality summary in VRAM simultaneously.
-    if num_ctx > 16384 and on_status:
+    # Local models can run out of VRAM when the compact prompt and the summary
+    # share one window. Cloud models do not need that warning.
+    if provider == "ollama" and num_ctx > 16384 and on_status:
         on_status(f"Large context ({num_ctx:,} tok) — compact uses full window; results may vary on small models.")
 
     blob = _prefix_text(prefix, char_budget=int(char_budget), prev_memory=_previous_memory(messages))
     result = None
     summary = ""
     try:
+        if on_reasoning is not None:
+            on_reasoning.start("REASONING · compact")
         result = chat_once(
-            host,
-            model,
-            [
+            provider,
+            host=host,
+            api_key=api_key,
+            model=model,
+            messages=[
                 {"role": "system", "content": COMPACT_SYS},
                 {"role": "user", "content": "Compress this log:\n\n" + blob},
             ],
@@ -393,13 +402,21 @@ def compact_messages(
                 "temperature": 0.1,
                 "num_ctx": compact_ctx,
                 "num_predict": num_predict,
+                "reasoning": reasoning,
             },
-            think=False,  # qwen3 / reasoning models: disable thinking so tokens go to the summary
             timeout=120,
         )
-        raw_content = ((result.get("message") or {}).get("content") or "")
-        # Strip qwen3 / DeepSeek-R1 style think blocks defensively
-        summary = _strip_think(raw_content).strip()
+        msg = result.get("message") if isinstance(result.get("message"), dict) else {}
+        body = finish_call(
+            on_reasoning,
+            provider,
+            reasoning,
+            msg,
+            hidden=bool(result.get("reasoning_hidden")),
+        )
+        # Keep think blocks out of the saved memory even when the pane stays empty.
+        cleaned, _inline = split_think(body)
+        summary = _strip_think(cleaned).strip()
     except Exception as e:
         summary = ""
         result = None
@@ -409,7 +426,7 @@ def compact_messages(
     # ----- Empty / failed compact -----
     if not summary:
         # `result` is always defined here (None on exception, dict otherwise).
-        logger.error("Empty summary from Ollama: %r", result)
+        logger.error("Empty summary from compact model: %r", result)
         # Build a clean fallback: primary system + non-system suffix, no full history.
         kept = [primary] + suffix_non_sys
         kept = hard_trim_messages(kept, thresh)

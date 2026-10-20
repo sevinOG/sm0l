@@ -22,6 +22,8 @@ MAX = {
     "list_dir": 3000,
     "grep": 4000,
     "shell": 4000,
+    "ask_local": 6000,
+    "hands_on": 4000,
     "generic": 4000,
 }
 
@@ -138,6 +140,26 @@ SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "ask_local",
+            "description": (
+                "Spawn an offline local GPU subagent (Ollama) from the active cloud agent via sm0l. "
+                "The subagent has search, fetch, files, grep, shell, and hands_on, and runs them on this machine. "
+                "It does not call the cloud and cannot spawn another subagent. "
+                "Use for private or heavy local work. Pass a clear task."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "What the local subagent should do"},
+                    "model": {"type": "string", "description": "Optional Ollama model name. Empty uses the harness default."},
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "shell",
             "description": "Run a shell command in the workspace. Use for git, python, builds, tests.",
             "parameters": {
@@ -146,6 +168,38 @@ SCHEMAS: list[dict] = [
                     "command": {"type": "string"},
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hands_on",
+            "description": (
+                "Drive the Windows desktop from screenshots. Grok looks at the screen and clicks, types, and presses keys. "
+                "Use only when the user asked to operate the screen. Do not use the shell for that same request. "
+                "Put their request in prompt. A plan is written from the recent chat and followed on every screenshot. "
+                "Pass window as desktop or shell to drive the desktop. "
+                "Pass an app title only when the user named that app. "
+                "If window is omitted and no app was named, the desktop is used."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The user's request. A fixed plan is written from the recent chat before any click.",
+                    },
+                    "window": {
+                        "type": "string",
+                        "description": "desktop or shell for the desktop. Otherwise an app title copied from the user's words, such as Notepad.",
+                    },
+                    "max_turns": {
+                        "type": "integer",
+                        "description": "How many screenshot turns. Default 12, max 24.",
+                    },
+                },
+                "required": ["prompt"],
             },
         },
     },
@@ -510,6 +564,212 @@ def tool_shell(workspace: Path, command: str, timeout: int = 60, **_k: Any) -> s
     return clip(f"exit {proc.returncode}\n{out.strip()}".strip(), MAX["shell"])
 
 
+_LOCAL = {"host": "http://127.0.0.1:11434", "model": ""}
+
+
+def set_local_runtime(host: str, model: str) -> None:
+    """Default Ollama target for ask_local. Called by the agent each turn."""
+    _LOCAL["host"] = (host or "http://127.0.0.1:11434").rstrip("/")
+    _LOCAL["model"] = (model or "").strip()
+
+
+_SUBAGENT_ROUNDS = 8
+
+
+def subagent_schemas() -> list[dict]:
+    """Tools a local subagent may call. ask_local is omitted so it cannot spawn another one."""
+    return schemas_for("ollama")
+
+
+def _local_turn(
+    host: str,
+    model: str,
+    messages: list[dict],
+    tools: list[dict] | None,
+    reasoning: str = "off",
+    reason_track=None,
+) -> dict:
+    from .ollama_client import chat_once
+    from .reasoning import finish_call, ollama_think
+
+    options = {"temperature": 0.2, "reasoning": reasoning}
+    think = ollama_think(reasoning)
+    if reason_track is not None:
+        reason_track.start("REASONING · local")
+    try:
+        result = chat_once(
+            host, model, messages, tools=tools, options=options, think=think, timeout=180
+        )
+    except Exception as e:
+        low = str(e).lower()
+        if tools and ("tool" in low or "does not support" in low or "400" in low):
+            result = chat_once(
+                host, model, messages, tools=None, options=options, think=think, timeout=180
+            )
+        else:
+            raise
+    msg = result.get("message") if isinstance(result.get("message"), dict) else None
+    if isinstance(msg, dict):
+        finish_call(
+            reason_track,
+            "ollama",
+            reasoning,
+            msg,
+            hidden=bool(result.get("reasoning_hidden")),
+        )
+    elif reason_track is not None:
+        reason_track.finish("ollama", reasoning, "", hidden=bool(result.get("reasoning_hidden")))
+    return result
+
+
+def _subagent_calls(message: dict) -> tuple[str, list[dict]]:
+    from .agent import TOOL_RE, parse_text_tool_calls
+
+    content = str(message.get("content") or "")
+    calls = list(message.get("tool_calls") or [])
+    if calls:
+        return content, calls
+    calls = parse_text_tool_calls(content)
+    if calls:
+        content = TOOL_RE.sub("", content).strip()
+    return content, calls
+
+
+def tool_ask_local(
+    workspace: Path,
+    task: str,
+    model: str = "",
+    provider: str = "",
+    host: str = "",
+    shell_timeout: int = 60,
+    should_cancel: Callable[[], bool] | None = None,
+    on_status: Callable[[str], None] | None = None,
+    on_window: Callable[[bool], None] | None = None,
+    on_badge: Callable[..., None] | None = None,
+    button_rect: Callable[[], Any] | None = None,
+    end_requested: Callable[[], bool] | None = None,
+    reasoning: str = "off",
+    reason_track=None,
+    **_k: Any,
+) -> str:
+    """Offline subagent with the local tool set. The prompt names who spawned it."""
+    from .agent import _args
+    from .ollama_client import list_models
+    from .personality import SUBAGENT_RUNTIME
+
+    task = (task or "").strip()
+    if not task:
+        return "ERROR: empty task"
+    caller = "Muse" if (provider or _k.get("provider") or "") == "meta" else "Grok"
+    host = (host or _LOCAL["host"] or "http://127.0.0.1:11434").rstrip("/")
+    chosen = (model or _LOCAL["model"] or "").strip()
+    if not chosen:
+        try:
+            names = [m["name"] for m in list_models(host)]
+        except Exception as e:
+            return f"ERROR: Ollama model list failed: {e}"
+        if not names:
+            return "ERROR: no local Ollama model. Start Ollama and pull a model."
+        chosen = names[0]
+    tools = subagent_schemas()
+    messages: list[dict] = [
+        {"role": "system", "content": SUBAGENT_RUNTIME.strip()},
+        {
+            "role": "user",
+            "content": (
+                f"{caller} (via sm0l) is asking you, a local GPU subagent, to do this:\n\n" + task
+            ),
+        },
+    ]
+    used: list[str] = []
+    text = ""
+    try:
+        for _round in range(_SUBAGENT_ROUNDS):
+            if should_cancel and should_cancel():
+                return "cancelled"
+            result = _local_turn(
+                host, chosen, messages, tools, reasoning=reasoning, reason_track=reason_track
+            )
+            msg = result.get("message") or {}
+            text, calls = _subagent_calls(msg)
+            if not calls:
+                break
+            assistant: dict[str, Any] = {"role": "assistant", "content": text, "tool_calls": calls}
+            messages.append(assistant)
+            for tc in calls:
+                if should_cancel and should_cancel():
+                    return "cancelled"
+                fn = tc.get("function") or tc
+                name = str(fn.get("name") or "")
+                arguments = _args(fn.get("arguments"))
+                if name == "ask_local":
+                    output = "ERROR: the local subagent cannot spawn another subagent"
+                else:
+                    if name == "hands_on":
+                        from .hands import prompt_has_action, window_argument
+
+                        arguments = dict(arguments)
+                        proposed = str(arguments.get("prompt") or "").strip()
+                        if not proposed or not prompt_has_action(proposed):
+                            arguments["prompt"] = task
+                        arguments["window"] = window_argument(
+                            str(arguments.get("window") or ""),
+                            f"{task}\n{arguments.get('prompt') or ''}",
+                        )
+                    if on_status:
+                        on_status(f"local subagent · {name}")
+                    output = run_tool(
+                        name,
+                        arguments,
+                        workspace,
+                        shell_timeout=shell_timeout,
+                        host=host,
+                        model=chosen,
+                        provider="ollama",
+                        api_key="",
+                        num_ctx=0,
+                        should_cancel=should_cancel,
+                        on_status=on_status,
+                        on_window=on_window,
+                        on_badge=on_badge,
+                        button_rect=button_rect,
+                        end_requested=end_requested,
+                        reasoning=reasoning,
+                        reason_track=reason_track,
+                    )
+                used.append(name or "tool")
+                messages.append(
+                    {
+                        "role": "tool",
+                        "content": output,
+                        "tool_name": name,
+                        "name": name,
+                    }
+                )
+        else:
+            text = (text or "").strip()
+            note = f"Stopped after {_SUBAGENT_ROUNDS} tool rounds."
+            text = f"{note}\n{text}".strip()
+    except Exception as e:
+        return f"ERROR: local subagent failed: {e}"
+    text = (text or "").strip()
+    header = f"[local subagent {chosen} — spawned by {caller} via sm0l]"
+    if used:
+        header += "\ntools: " + ", ".join(used)
+    if not text:
+        if used:
+            text = "The subagent finished the tool calls and did not add a summary."
+        else:
+            return f"ERROR: local subagent {chosen} returned empty"
+    return clip(f"{header}\n{text}", MAX["ask_local"])
+
+
+def schemas_for(provider: str) -> list[dict]:
+    if provider in ("xai", "meta"):
+        return SCHEMAS
+    return [s for s in SCHEMAS if (s.get("function") or {}).get("name") != "ask_local"]
+
+
 _HANDLERS: dict[str, Callable[..., str]] = {
     "search": lambda workspace, **k: tool_search(**k),
     "fetch": lambda workspace, **k: tool_fetch(**k),
@@ -519,19 +779,75 @@ _HANDLERS: dict[str, Callable[..., str]] = {
     "list_dir": lambda workspace, **k: tool_list_dir(workspace, **k),
     "grep": lambda workspace, **k: tool_grep(workspace, **k),
     "shell": lambda workspace, **k: tool_shell(workspace, **k),
+    "ask_local": lambda workspace, **k: tool_ask_local(workspace, **k),
+    "hands_on": lambda workspace, **k: _hands_on(workspace, **k),
 }
 
 
-def run_tool(name: str, arguments: dict, workspace: Path, shell_timeout: int = 60) -> str:
+def _hands_on(workspace: Path, **k: Any) -> str:
+    from .hands import tool_hands_on
+
+    return tool_hands_on(workspace, **k)
+
+
+def run_tool(
+    name: str,
+    arguments: dict,
+    workspace: Path,
+    shell_timeout: int = 60,
+    *,
+    host: str = "",
+    model: str = "",
+    provider: str = "",
+    api_key: str = "",
+    num_ctx: int = 0,
+    should_cancel: Callable[[], bool] | None = None,
+    on_status: Callable[[str], None] | None = None,
+    on_window: Callable[[bool], None] | None = None,
+    on_badge: Callable[..., None] | None = None,
+    button_rect: Callable[[], Any] | None = None,
+    end_requested: Callable[[], bool] | None = None,
+    reasoning: str = "off",
+    reason_track=None,
+) -> str:
     fn = _HANDLERS.get(name)
     if not fn:
         return f"ERROR: unknown tool {name}"
     args = dict(arguments or {})
     if name == "shell":
         args["timeout"] = shell_timeout
+    if name == "ask_local":
+        args["provider"] = provider
+        args["host"] = host
+        args["shell_timeout"] = shell_timeout
+        args["should_cancel"] = should_cancel
+        args["on_status"] = on_status
+        args["on_window"] = on_window
+        args["on_badge"] = on_badge
+        args["button_rect"] = button_rect
+        args["end_requested"] = end_requested
+        args["reasoning"] = reasoning
+        args["reason_track"] = reason_track
+    if name == "hands_on":
+        args["host"] = host
+        args["model"] = model
+        args["provider"] = provider or "xai"
+        args["api_key"] = api_key
+        args["num_ctx"] = num_ctx
+        args["should_cancel"] = should_cancel
+        args["on_status"] = on_status
+        args["on_window"] = on_window
+        args["on_badge"] = on_badge
+        args["button_rect"] = button_rect
+        args["end_requested"] = end_requested
+        args["reasoning"] = reasoning
+        args["reason_track"] = reason_track
     try:
-        return fn(workspace=workspace, **args)
+        out = fn(workspace=workspace, **args)
     except TypeError as e:
         return f"ERROR: bad arguments for {name}: {e}"
     except Exception as e:
         return f"ERROR in {name}: {e}"
+    if name == "hands_on":
+        return clip(out, MAX["hands_on"])
+    return out

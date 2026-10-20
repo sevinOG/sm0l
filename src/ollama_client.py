@@ -115,6 +115,33 @@ def effective_num_ctx(host: str, model: str, override: int) -> int:
     return native
 
 
+def _retry_without_think(exc: Exception, *, tools: bool) -> bool:
+    text = str(exc).lower()
+    if "think" in text:
+        return True
+    if tools:
+        return False
+    return "400" in text
+
+
+def _stamp_reasoning(data: dict, *, hidden: bool) -> dict:
+    from .reasoning import pull_reasoning
+
+    msg = data.get("message")
+    if isinstance(msg, dict):
+        thought = pull_reasoning(msg)
+        if thought and "reasoning" not in msg:
+            msg = dict(msg)
+            msg["reasoning"] = thought
+            data = dict(data)
+            data["message"] = msg
+    if not isinstance(data, dict):
+        return data
+    out = dict(data)
+    out["reasoning_hidden"] = bool(hidden) and not pull_reasoning(out.get("message") if isinstance(out.get("message"), dict) else None)
+    return out
+
+
 def chat_once(
     host: str,
     model: str,
@@ -122,22 +149,35 @@ def chat_once(
     *,
     tools: list[dict] | None = None,
     options: dict | None = None,
-    think: bool | None = None,
+    think: bool | str | None = None,
     timeout: float = 180,
 ) -> dict:
     from .media import prepare_ollama_messages
+    from .reasoning import model_options
 
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": prepare_ollama_messages(messages),
-        "stream": False,
-        "options": options or {},
-    }
-    if tools:
-        payload["tools"] = tools
-    if think is not None:
-        payload["think"] = think
-    return _request(host, "/api/chat", payload, timeout=timeout)
+    def _call(think_value: bool | str | None) -> dict:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": prepare_ollama_messages(messages),
+            "stream": False,
+            "options": model_options(options),
+        }
+        if tools:
+            payload["tools"] = tools
+        if think_value is not None:
+            payload["think"] = think_value
+        return _request(host, "/api/chat", payload, timeout=timeout)
+
+    hidden = False
+    try:
+        data = _call(think)
+    except RuntimeError as e:
+        if think not in (None, False) and _retry_without_think(e, tools=bool(tools)):
+            data = _call(False)
+            hidden = True
+        else:
+            raise
+    return _stamp_reasoning(data, hidden=hidden)
 
 
 def chat_stream(
@@ -147,32 +187,36 @@ def chat_stream(
     *,
     tools: list[dict] | None = None,
     options: dict | None = None,
-    think: bool | None = None,
+    think: bool | str | None = None,
     timeout: float = 600,
     on_token: Callable[[str], None] | None = None,
+    on_reasoning: Callable[[str], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> dict:
     """
     Stream a chat turn. Returns the assembled assistant message plus usage:
-      {message, prompt_eval_count, eval_count, used_tools_api}
+      {message, prompt_eval_count, eval_count, used_tools_api, reasoning_hidden}
     """
     from .media import prepare_ollama_messages
+    from .reasoning import model_options, text_of
 
-    payload: dict[str, Any] = {
+    base: dict[str, Any] = {
         "model": model,
         "messages": prepare_ollama_messages(messages),
         "stream": True,
-        "options": options or {},
+        "options": model_options(options),
     }
     if tools:
-        payload["tools"] = tools
-    if think is not None:
-        payload["think"] = think
+        base["tools"] = tools
 
-    def _run(with_tools: bool) -> dict:
-        body = dict(payload)
+    def _run(with_tools: bool, think_value: bool | str | None) -> dict:
+        body = dict(base)
         if not with_tools:
             body.pop("tools", None)
+        if think_value is None:
+            body.pop("think", None)
+        else:
+            body["think"] = think_value
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             _url(host, "/api/chat"),
@@ -181,6 +225,7 @@ def chat_stream(
             method="POST",
         )
         content = ""
+        reasoning = ""
         tool_calls: list[dict] = []
         prompt_eval = 0
         eval_count = 0
@@ -197,11 +242,16 @@ def chat_stream(
                     except json.JSONDecodeError:
                         continue
                     msg = chunk.get("message") or {}
-                    piece = msg.get("content") or ""
+                    piece = text_of(msg.get("content"))
                     if piece:
                         content += piece
                         if on_token:
                             on_token(piece)
+                    thought = text_of(msg.get("thinking")) or text_of(msg.get("reasoning"))
+                    if thought:
+                        reasoning += thought
+                        if on_reasoning:
+                            on_reasoning(thought)
                     for tc in msg.get("tool_calls") or []:
                         tool_calls.append(tc)
                     if chunk.get("prompt_eval_count"):
@@ -214,6 +264,8 @@ def chat_stream(
         except urllib.error.URLError as e:
             raise RuntimeError(f"Ollama unreachable at {host}: {e.reason}") from e
         message: dict[str, Any] = {"role": "assistant", "content": content}
+        if reasoning:
+            message["reasoning"] = reasoning
         if tool_calls:
             message["tool_calls"] = tool_calls
         return {
@@ -221,14 +273,30 @@ def chat_stream(
             "prompt_eval_count": prompt_eval,
             "eval_count": eval_count,
             "used_tools_api": with_tools,
+            "reasoning_hidden": False,
         }
 
-    try:
-        return _run(bool(tools))
-    except RuntimeError as e:
-        text = str(e).lower()
+    def _without_tools(think_value: bool | str | None, err: Exception) -> dict | None:
+        text = str(err).lower()
         if tools and ("tool" in text or "does not support" in text or "400" in text):
-            return _run(False)
+            return _run(False, think_value)
+        return None
+
+    try:
+        return _run(bool(tools), think)
+    except RuntimeError as e:
+        if think not in (None, False) and _retry_without_think(e, tools=bool(tools)):
+            try:
+                result = _run(bool(tools), False)
+            except RuntimeError as e2:
+                result = _without_tools(False, e2)
+                if result is None:
+                    raise
+            result["reasoning_hidden"] = not text_of((result.get("message") or {}).get("reasoning"))
+            return result
+        stripped = _without_tools(think, e)
+        if stripped is not None:
+            return stripped
         raise
 
 

@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .paths import sessions_dir
+from .paths import sessions_dir, user_data
 
 
 @dataclass
@@ -95,3 +95,44 @@ def delete_session(sid: str) -> None:
     path = sessions_dir() / f"{sid}.json"
     if path.is_file():
         path.unlink()
+
+
+def choose_session_id(last_id: str | None, ordered_ids: list[str]) -> str | None:
+    """Pick the last thread when it is still on disk, else the newest, else none."""
+    ids = [str(item) for item in ordered_ids if item]
+    if last_id and str(last_id) in ids:
+        return str(last_id)
+    return ids[0] if ids else None
+
+
+def read_last_session_id() -> str | None:
+    path = user_data() / "last_session.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        sid = str((data or {}).get("id") or "")
+    except Exception:
+        return None
+    return sid or None
+
+
+def remember_session(sid: str) -> None:
+    path = user_data() / "last_session.json"
+    path.write_text(json.dumps({"id": sid}), encoding="utf-8")
+
+
+def resume_session(model: str = "") -> Session:
+    """Open the last thread if it still exists, else the newest, else a new one."""
+    items = list_sessions()
+    ids = [str(item.get("id") or "") for item in items]
+    chosen = choose_session_id(read_last_session_id(), ids)
+    if chosen:
+        loaded = load_session(chosen)
+        if loaded is not None:
+            return loaded
+    for sid in ids:
+        loaded = load_session(sid)
+        if loaded is not None:
+            return loaded
+    return new_session(model)

@@ -1,3 +1,3 @@
-"""sm0l — tiny local coding/research agent for 5–8B Ollama models."""
+"""sm0l — Grok harness with local GPU subagents."""
 
-__version__ = "0.2.5"
+__version__ = "1.0.0"
